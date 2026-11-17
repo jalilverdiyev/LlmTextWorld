@@ -1,0 +1,39 @@
+{
+    "types": {
+        "P": {"label": "player", "description": "the player character; the only one who executes commands"},
+        "I": {"label": "inventory", "description": "the player's inventory (items currently carried)"},
+        "r": {"label": "room", "description": "a location the player can be in"},
+        "c": {"label": "container", "description": "a fixed, openable and lockable container that can hold objects"},
+        "k": {"label": "key", "description": "a portable object that locks/unlocks the container or door it matches"},
+        "d": {"label": "door", "description": "an openable and lockable door linking two rooms"},
+        "s": {"label": "supporter", "description": "a fixed surface that objects can be put on"},
+        "f": {"label": "food", "description": "a portable, edible object"},
+        "o": {"label": "object", "description": "a generic portable object"},
+        "t": {"label": "thing", "description": "any object in the world"}
+    },
+    "predicates": {
+        "at": [
+            {"args": ["P", "*"], "text": "{0} is in {1}"},
+            {"args": ["*", "r"], "text": "{0} is located in {1}"}
+        ],
+        "in": [
+            {"args": ["*", "I"], "text": "{0} is carried by the player (in the inventory)"},
+            {"args": ["*", "c"], "text": "{0} is inside {1}"}
+        ],
+        "on": [
+            {"args": ["*", "s"], "text": "{0} is on {1}"}
+        ],
+        "open": [{"args": ["*"], "text": "{0} is open"}],
+        "closed": [{"args": ["*"], "text": "{0} is closed"}],
+        "locked": [{"args": ["*"], "text": "{0} is locked"}],
+        "match": [{"args": ["k", "*"], "text": "{0} is the matching key of {1}"}],
+        "edible": [{"args": ["*"], "text": "{0} is edible"}],
+        "eaten": [{"args": ["*"], "text": "{0} has been eaten"}],
+        "link": [{"args": ["r", "d", "r"], "text": "{0} and {2} are connected by {1}"}],
+        "free": [{"args": ["r", "r"], "text": "{0} and {1} are directly passable"}],
+        "north_of": [{"args": ["r", "r"], "text": "{0} is north of {1}"}],
+        "south_of": [{"args": ["r", "r"], "text": "{0} is south of {1}"}],
+        "east_of": [{"args": ["r", "r"], "text": "{0} is east of {1}"}],
+        "west_of": [{"args": ["r", "r"], "text": "{0} is west of {1}"}]
+    }
+}
