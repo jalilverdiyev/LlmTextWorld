@@ -23,6 +23,7 @@ from typing import Any, Optional
 
 import config
 import inferer
+import logs
 import validator
 
 log = logging.getLogger("generator")
@@ -140,7 +141,9 @@ def build_prompt(game: Game, types: TypeDefinitions, num_quests: int = 1) -> str
 
     lines += [
         "You design quests for a text-based adventure game (TextWorld).",
-        f"Create {num_quests} new, distinct quest(s) that can be completed in the world described below.",
+        f"Create exactly {num_quests} new quest(s) for the world described below.",
+        "A quest is ONE complete multi-step objective. Its `commands` list holds the entire "
+        "sequence of steps needed to finish it, usually 3 or more commands.",
         "",
         "## Entity types",
     ]
@@ -168,22 +171,27 @@ def build_prompt(game: Game, types: TypeDefinitions, num_quests: int = 1) -> str
         lines += [f"- {t}" for t in templates]
 
     if game.quests:
-        lines += ["", "## Existing quests (new quests must differ from these)"]
-        for q in game.quests:
-            lines.append(f"- {q.get('desc', '')}")
+        lines += ["", "## Existing quests",
+                  "Each of these is ONE quest. Do not repeat them, and do not return them or "
+                  "parts of them (single steps or sub-sequences) as new quests. "
+                  "Your quests must pursue different goals."]
+        for i, q in enumerate(game.quests, 1):
+            lines.append(f"- Existing quest {i}: {q.get('desc', '')}")
             lines.append("  commands: " + json.dumps(q.get("commands", [])))
 
     lines += [
         "",
         "## Rules",
+        f"- Return exactly {num_quests} quest(s) in the `quests` array, no more and no fewer.",
+        "- Never split one quest into several quests: each individual step belongs inside the `commands` of the quest it is part of, not in a quest of its own.",
         "- `commands` is the ordered list of commands the player types, starting from the initial world state, to complete the quest.",
         "- Every command must be valid in the world state reached by the previous commands (be in the right room, hold required items, open closed containers, etc.).",
         "- Only use entities that exist above, written with their exact names.",
-        "- `desc` is a short, player-facing description of the goal; do not reveal the commands.",
+        "- `desc` is a short, player-facing description of the whole goal; do not reveal the commands.",
         "",
         "## Output format",
-        "Respond with a single JSON object and nothing else:",
-        '{"quests": [{"desc": "<goal description>", "commands": ["<command 1>", "<command 2>"]}]}',
+        f"Respond with a single JSON object and nothing else. The `quests` array must contain exactly {num_quests} object(s); each has one `desc` string and one `commands` array holding ALL steps of that quest:",
+        '{"quests": [{"desc": "<goal of this quest>", "commands": ["<step 1>", "<step 2>", "<step 3>", "..."]}]}',
     ]
     return "\n".join(lines)
 
@@ -229,15 +237,51 @@ def make_quest(desc: str, commands: list[str]) -> dict[str, Any]:
     }
 
 
-def collect_valid_quests(raw_quests: list[dict[str, Any]], game: Game) -> list[dict[str, Any]]:
-    quests = []
+def _norm(commands: list[str]) -> list[str]:
+    return [" ".join(c.lower().split()) for c in commands]
+
+
+def _contains(whole: list[str], part: list[str]) -> bool:
+    """True if `part` appears as a contiguous run inside `whole`."""
+    n = len(part)
+    return any(whole[i:i + n] == part for i in range(len(whole) - n + 1))
+
+
+def collect_valid_quests(raw_quests: list[dict[str, Any]], game: Game,
+                         limit: Optional[int] = None) -> list[dict[str, Any]]:
+    """Keeps structurally valid quests, drops copies/fragments, and caps the count at `limit`.
+
+    A candidate is dropped when its commands are a contiguous part of an existing quest
+    (the model re-emitting or splitting a known quest) or of another candidate (one quest
+    split into pieces; identical duplicates keep only the first).
+    """
+    candidates = []
     for raw in raw_quests:
         candidate = make_quest(str(raw.get("desc", "")).strip(), raw.get("commands"))
         result = validator.validate_quest(game.data, candidate)
         if result.ok:
-            quests.append(candidate)
+            candidates.append(candidate)
         else:
             log.warning("Dropping invalid quest %r: %s", raw.get("desc"), "; ".join(result.errors))
+
+    existing = [_norm(q["commands"]) for q in game.quests if isinstance(q.get("commands"), list)]
+    commands = [_norm(c["commands"]) for c in candidates]
+    quests = []
+    for i, candidate in enumerate(candidates):
+        if any(_contains(e, commands[i]) for e in existing):
+            log.warning("Dropping quest %r: repeats or splits an existing quest", candidate["desc"])
+        elif any(j != i and _contains(commands[j], commands[i])
+                 and (len(commands[j]) > len(commands[i]) or j < i)
+                 for j in range(len(candidates))):
+            log.warning("Dropping quest %r: duplicate or fragment of another generated quest",
+                        candidate["desc"])
+        else:
+            quests.append(candidate)
+
+    if limit is not None and len(quests) > limit:
+        log.warning("Model returned %d usable quests but %d were requested; keeping the first %d",
+                    len(quests), limit, limit)
+        quests = quests[:limit]
     return quests
 
 
@@ -256,33 +300,41 @@ def main(argv: Optional[list[str]] = None) -> int:
     inferer.add_inference_args(parser)
     args = parser.parse_args(argv)
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-
     try:
+        config.load_dotenv(args.env_file)
+        logs.setup_from_args("generator", args, argv)
         game = Game(load_json(args.game))
         prompt = build_prompt(game, TypeDefinitions.load(args.types), args.num_quests)
-    except GameFormatError as e:
+    except (GameFormatError, config.ConfigError, OSError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
 
+    log.debug("Game %s: %d entities, %d existing quest(s), num_quests=%d",
+              args.game, len(game.entities), len(game.quests), args.num_quests)
     if args.save_prompt:
         Path(args.save_prompt).write_text(prompt, encoding="utf-8")
     if args.prompt_only:
+        log.debug(logs.block("prompt", prompt))
         print(prompt)
         return 0
     try:
         result = inferer.inferer_from_args(args).generate(
             prompt, json_mode=True, label=Path(args.game).name)
     except (config.ConfigError, inferer.InferenceError) as e:
+        log.error("Generation failed: %s", e)
         print(f"error: {e}", file=sys.stderr)
         return 1
 
     try:
-        quests = collect_valid_quests(parse_quests(result.text), game)
+        parsed = parse_quests(result.text)
+        log.debug("Parsed %d quest object(s) from the model response", len(parsed))
+        quests = collect_valid_quests(parsed, game, args.num_quests)
     except (ValueError, KeyError) as e:
+        log.error("Could not parse model output: %s", e)
         print(f"error: could not parse model output ({e}). Raw output:\n{result.text}", file=sys.stderr)
         return 1
     if not quests:
+        log.error("The model produced no valid quests")
         print("error: the model produced no valid quests", file=sys.stderr)
         return 1
 
@@ -291,6 +343,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     out_path = Path(args.output) if args.output else Path(args.game).with_suffix(".generated.json")
     out_path.write_text(json.dumps(output, indent=4), encoding="utf-8")
     log.info("Wrote %d new quest(s) to %s", len(quests), out_path)
+    log.debug(logs.block("accepted quests", json.dumps(quests, indent=2)))
     for q in quests:
         print(f"- {q['desc']}\n  {q['commands']}")
     return 0

@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from config import ConfigError, load_dotenv, resolve, to_bool
+from logs import add_logging_args, block, setup_from_args
 from metrics import DEFAULT_METRICS_LOG, MB, MetricsLogger, ResourceMonitor
 
 log = logging.getLogger("inferer")
@@ -116,6 +117,12 @@ class OllamaInferer:
         ttft: Optional[float] = None
         chunks = 0
 
+        log.debug("Request to %s: model=%s label=%r json_mode=%s options=%s keep_alive=%s think=%s",
+                  self.host, self.model, label, json_mode, merged, self.keep_alive, self.think)
+        if system:
+            log.debug(block("system prompt", system))
+        log.debug(block("prompt", prompt))
+
         monitor.start()
         start = time.perf_counter()
         try:
@@ -137,9 +144,15 @@ class OllamaInferer:
                     chunks += bool(token or thought)
                     if chunk.get("done"):
                         final = chunk
+        except Exception:
+            log.debug("Inference failed; any partial output is logged below", exc_info=True)
+            raise
         finally:
             total = time.perf_counter() - start
             resources = monitor.stop()
+            if thinking_parts:
+                log.debug(block("model thinking (raw)", "".join(thinking_parts)))
+            log.debug(block("model response (raw)", "".join(text_parts)))
 
         ns = 1e-9
         eval_count = final.get("eval_count")
@@ -183,7 +196,7 @@ def add_inference_args(parser: argparse.ArgumentParser) -> None:
                         help=f"JSONL file metrics are appended to [env: METRICS_LOG, default: {DEFAULT_METRICS_LOG}]")
     parser.add_argument("--sample-interval", type=float,
                         help="Resource sampling interval in seconds [env: METRICS_SAMPLE_INTERVAL, default: 0.5]")
-
+    add_logging_args(parser)
 
 def inferer_from_args(args: argparse.Namespace) -> OllamaInferer:
     """Builds an inferer from CLI args, the environment and the .env file. Raises ConfigError."""
@@ -223,15 +236,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--json", action="store_true", help="Constrain output to valid JSON")
     args = parser.parse_args(argv)
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    prompt = args.prompt
-    if args.prompt_file:
-        with open(args.prompt_file, encoding="utf-8") as f:
-            prompt = f.read()
-
     try:
+        setup_from_args("inferer", args, argv)
+        prompt = args.prompt
+        if args.prompt_file:
+            with open(args.prompt_file, encoding="utf-8") as f:
+                prompt = f.read()
         result = inferer_from_args(args).generate(prompt, system=args.system, json_mode=args.json)
-    except (ConfigError, InferenceError) as e:
+    except (ConfigError, InferenceError, OSError) as e:
+        logging.getLogger("inferer").debug("Run failed: %s", e)
         print(f"error: {e}", file=sys.stderr)
         return 1
     print(result.text)
