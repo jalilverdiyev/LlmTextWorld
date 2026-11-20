@@ -4,10 +4,18 @@ Usage:
     # Only print the prompt
     python generator.py game.json --prompt-only
 
+    # Fill win_events of the quests already in the file from their commands (no LLM)
+    python generator.py game.json --fill-win-events [--overwrite] [--output out.json]
+
+    # Add --compile to either mode to rebuild the playable .z8 for the written JSON
+    # (the compiled game contains the quests, so it must be rebuilt after they change)
+
     # Generate quests with a local Ollama model and write a new game file
     python generator.py game.json --model llama3.2 --num-quests 3 --output game.generated.json
 
 Entity types and predicate wording live in entity_types.json (override with --types).
+Each generated quest gets its `win_events` derived from its commands (see quest_builder.py),
+which needs the `textworld` package, so run this inside the environment where it is installed.
 """
 
 from __future__ import annotations
@@ -22,8 +30,10 @@ from pathlib import Path
 from typing import Any, Optional
 
 import config
+import game_compiler
 import inferer
 import logs
+from quest_builder import QuestBuilder, QuestBuildError, TextWorldUnavailableError, refresh_metadata
 import validator
 
 log = logging.getLogger("generator")
@@ -224,13 +234,13 @@ def parse_quests(text: str) -> list[dict[str, Any]]:
     return [q for q in data if isinstance(q, dict)]
 
 
-def make_quest(desc: str, commands: list[str]) -> dict[str, Any]:
-    """Quest in the game-file schema. win_events are left empty for now."""
+def make_quest(desc: str, commands: list[str], win_events: list[dict[str, Any]]) -> dict[str, Any]:
+    """Quest in the game-file schema."""
     return {
         "desc": desc,
         "reward": 1,
         "commands": commands,
-        "win_events": [],
+        "win_events": win_events,
         "fail_events": [],
         "optional": False,
         "repeatable": False,
@@ -247,22 +257,29 @@ def _contains(whole: list[str], part: list[str]) -> bool:
     return any(whole[i:i + n] == part for i in range(len(whole) - n + 1))
 
 
-def collect_valid_quests(raw_quests: list[dict[str, Any]], game: Game,
+def collect_valid_quests(raw_quests: list[dict[str, Any]], game: Game, builder: QuestBuilder,
                          limit: Optional[int] = None) -> list[dict[str, Any]]:
-    """Keeps structurally valid quests, drops copies/fragments, and caps the count at `limit`.
+    """Turns raw model quests into complete game-file quests.
 
-    A candidate is dropped when its commands are a contiguous part of an existing quest
-    (the model re-emitting or splitting a known quest) or of another candidate (one quest
-    split into pieces; identical duplicates keep only the first).
+    Quests are kept only if they are well-formed and executable from the initial world state
+    (the builder derives their `win_events`; commands are rewritten to their canonical form).
+    Then candidates are dropped when their commands are a contiguous part of an existing quest
+    (the model re-emitting or splitting a known quest) or of another candidate (one quest split
+    into pieces; identical duplicates keep only the first). The count is capped at `limit`.
     """
     candidates = []
     for raw in raw_quests:
-        candidate = make_quest(str(raw.get("desc", "")).strip(), raw.get("commands"))
-        result = validator.validate_quest(game.data, candidate)
-        if result.ok:
-            candidates.append(candidate)
-        else:
-            log.warning("Dropping invalid quest %r: %s", raw.get("desc"), "; ".join(result.errors))
+        desc = str(raw.get("desc", "")).strip()
+        structural = validator.validate_quest(game.data, make_quest(desc, raw.get("commands"), []))
+        if not structural.ok:
+            log.warning("Dropping invalid quest %r: %s", raw.get("desc"), "; ".join(structural.errors))
+            continue
+        try:
+            commands, win_event = builder.build_win_event(raw["commands"])
+        except QuestBuildError as e:
+            log.warning("Dropping quest %r: not executable from the initial state (%s)", desc, e)
+            continue
+        candidates.append(make_quest(desc, commands, [win_event]))
 
     existing = [_norm(q["commands"]) for q in game.quests if isinstance(q.get("commands"), list)]
     commands = [_norm(c["commands"]) for c in candidates]
@@ -285,6 +302,61 @@ def collect_valid_quests(raw_quests: list[dict[str, Any]], game: Game,
     return quests
 
 
+def fill_win_events(data: dict[str, Any], builder: QuestBuilder,
+                    overwrite: bool = False) -> tuple[dict[str, Any], int, int, int]:
+    """Fills `win_events` of existing quests from their `commands`, without any LLM.
+
+    Quests that already have win_events are left alone unless `overwrite` is set. Quests whose
+    commands cannot be executed are left unchanged and reported. Returns
+    (new game data, filled, skipped, failed).
+    """
+    output = copy.deepcopy(data)
+    filled = skipped = failed = 0
+    for i, quest in enumerate(output.get("quests", []), 1):
+        label = f"quest {i} ({str(quest.get('desc', ''))[:50]!r})"
+        if quest.get("win_events") and not overwrite:
+            skipped += 1
+            log.info("Skipping %s: already has win_events", label)
+            continue
+        commands = quest.get("commands")
+        if not isinstance(commands, list) or not all(isinstance(c, str) for c in commands):
+            failed += 1
+            log.warning("Cannot fill %s: it has no valid 'commands' list", label)
+            continue
+        try:
+            quest["commands"], win_event = builder.build_win_event(commands)
+        except QuestBuildError as e:
+            failed += 1
+            log.warning("Cannot fill %s: %s", label, e)
+            continue
+        quest["win_events"] = [win_event]
+        filled += 1
+        log.info("Filled win_events of %s", label)
+    return output, filled, skipped, failed
+
+
+def refresh_derived_fields(data: dict[str, Any]) -> dict[str, Any]:
+    """Rebuilds `objective` and `metadata.walkthrough` from the quests; keeps the data on failure."""
+    try:
+        return refresh_metadata(data)
+    except (QuestBuildError, TextWorldUnavailableError) as e:
+        log.warning("objective/walkthrough not refreshed: %s", e)
+        return data
+
+
+def compile_output(path: Path) -> bool:
+    """Compiles the game JSON at `path` to a .z8 next to it, reporting errors. True on success."""
+    try:
+        z8 = game_compiler.compile_game_file(path)
+    except game_compiler.CompileError as e:
+        log.error("Compilation failed: %s", e)
+        print(f"error: {e}", file=sys.stderr)
+        return False
+    log.info("Compiled %s", z8)
+    print(f"Compiled {z8}")
+    return True
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -295,6 +367,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--output", help="Output game file (default: <game>.generated.json)")
     parser.add_argument("--replace-quests", action="store_true",
                         help="Replace existing quests instead of appending")
+    parser.add_argument("--fill-win-events", action="store_true",
+                        help="No LLM: fill the win_events of the file's existing quests from their commands")
+    parser.add_argument("--overwrite", action="store_true",
+                        help="With --fill-win-events: also rebuild quests that already have win_events")
+    parser.add_argument("--keep-objective", action="store_true",
+                        help="Do not rebuild the game's objective text and metadata.walkthrough from the quests")
+    parser.add_argument("--compile", action="store_true",
+                        help="After writing the output JSON, compile it to a playable .z8 next to it")
     parser.add_argument("--prompt-only", action="store_true", help="Print the prompt and exit")
     parser.add_argument("--save-prompt", help="Also write the prompt to this file")
     inferer.add_inference_args(parser)
@@ -304,13 +384,45 @@ def main(argv: Optional[list[str]] = None) -> int:
         config.load_dotenv(args.env_file)
         logs.setup_from_args("generator", args, argv)
         game = Game(load_json(args.game))
-        prompt = build_prompt(game, TypeDefinitions.load(args.types), args.num_quests)
+        if not args.fill_win_events:
+            prompt = build_prompt(game, TypeDefinitions.load(args.types), args.num_quests)
     except (GameFormatError, config.ConfigError, OSError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
 
     log.debug("Game %s: %d entities, %d existing quest(s), num_quests=%d",
               args.game, len(game.entities), len(game.quests), args.num_quests)
+    out_path = Path(args.output) if args.output else Path(args.game).with_suffix(".generated.json")
+
+    if args.fill_win_events:
+        try:
+            output, filled, skipped, failed = fill_win_events(
+                game.data, QuestBuilder(game.data), args.overwrite)
+        except (QuestBuildError, TextWorldUnavailableError) as e:
+            log.error("Filling win_events failed: %s", e)
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        refreshed = False
+        if not args.keep_objective and not failed:
+            updated = refresh_derived_fields(output)
+            refreshed = (updated.get("objective"), updated.get("metadata", {}).get("walkthrough")) != (
+                game.data.get("objective"), game.data.get("metadata", {}).get("walkthrough"))
+            output = updated
+        changed = bool(filled) or refreshed
+        if changed:
+            out_path.write_text(json.dumps(output, indent=4), encoding="utf-8")
+        print(f"win_events: {filled} filled, {skipped} skipped, {failed} failed; "
+              f"objective/walkthrough {'refreshed' if refreshed else 'unchanged'}"
+              + (f" -> {out_path}" if changed else " (nothing written)"))
+        compiled = True
+        if args.compile and not failed:
+            # With nothing to change, the game file itself is already the final result.
+            compiled = compile_output(out_path if changed else Path(args.game))
+        elif args.compile:
+            print("error: not compiling because some quests could not be filled", file=sys.stderr)
+            compiled = False
+        return 0 if compiled and not failed else 1
+
     if args.save_prompt:
         Path(args.save_prompt).write_text(prompt, encoding="utf-8")
     if args.prompt_only:
@@ -318,9 +430,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(prompt)
         return 0
     try:
+        # Created before inference so a missing TextWorld install fails fast, not after the LLM call.
+        builder = QuestBuilder(game.data)
         result = inferer.inferer_from_args(args).generate(
             prompt, json_mode=True, label=Path(args.game).name)
-    except (config.ConfigError, inferer.InferenceError) as e:
+    except (config.ConfigError, inferer.InferenceError, QuestBuildError, TextWorldUnavailableError) as e:
         log.error("Generation failed: %s", e)
         print(f"error: {e}", file=sys.stderr)
         return 1
@@ -328,7 +442,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     try:
         parsed = parse_quests(result.text)
         log.debug("Parsed %d quest object(s) from the model response", len(parsed))
-        quests = collect_valid_quests(parsed, game, args.num_quests)
+        quests = collect_valid_quests(parsed, game, builder, args.num_quests)
     except (ValueError, KeyError) as e:
         log.error("Could not parse model output: %s", e)
         print(f"error: could not parse model output ({e}). Raw output:\n{result.text}", file=sys.stderr)
@@ -340,12 +454,15 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     output = copy.deepcopy(game.data)
     output["quests"] = quests if args.replace_quests else output.get("quests", []) + quests
-    out_path = Path(args.output) if args.output else Path(args.game).with_suffix(".generated.json")
+    if not args.keep_objective:
+        output = refresh_derived_fields(output)
     out_path.write_text(json.dumps(output, indent=4), encoding="utf-8")
     log.info("Wrote %d new quest(s) to %s", len(quests), out_path)
     log.debug(logs.block("accepted quests", json.dumps(quests, indent=2)))
     for q in quests:
         print(f"- {q['desc']}\n  {q['commands']}")
+    if args.compile and not compile_output(out_path):
+        return 1
     return 0
 
 
