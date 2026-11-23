@@ -1,0 +1,74 @@
+Bootstrap: docker
+From: ubuntu:26.04
+
+%environment
+    export OLLAMA_MODELS=/shared_models
+
+%post
+    export DEBIAN_FRONTEND=noninteractive
+    export TZ=Etc/UTC
+    
+    # Install prerequisites and utilities
+    apt-get update && apt-get install -y \
+        curl \
+        git \
+        wget \
+        zip \
+        unzip \
+        ca-certificates \
+        apt-transport-https \
+        python3 \
+        python3-pip \
+        python3-venv \
+        python3-dev \
+        build-essential \
+        libffi-dev \
+        zstd
+        
+    # Python configs
+    python3 -m venv /opt/venv
+    export PATH="/opt/venv/bin:$PATH"
+    python3 --version && pip --version
+
+    # Clone the generator and install requirements
+    git clone https://github.com/jalilverdiyev/LlmTextWorld
+    pip install textworld psutil
+
+    # Install the Ollama binary
+    curl -fsSL https://ollama.com/install.sh | sh
+
+    # Create mount points for the cluster
+    mkdir -p /shared_models
+    mkdir -p /output
+    mkdir -p /input
+
+%runscript
+    #!/bin/bash
+    
+    # Default to a specific model if none is provided
+    MODEL_TAG=${TARGET_MODEL:-"llama3:8b"}
+
+    echo "Starting Ollama server..."
+    ollama serve > /output/ollama_background.log 2>&1 &
+    OLLAMA_PID=$!
+
+    # Wait for the API to become available
+    echo "Waiting for Ollama to initialize..."
+    sleep 5
+    echo "Ensuring model '$MODEL_TAG' is available..."
+    ollama pull $MODEL_TAG
+
+    # Start the quest generation
+    echo "Statring the quest generation for $MODEL_TAG..."
+    cd LlmTextWorld/src/quest-generator/
+    mv /input/.env ./.env
+    mkdir /output/logs
+    python3 generator.py /input/game.json --model $MODEL_TAG --num-quests NUM_QUESTS --compile --output /output/generated.json --log-dir /output/logs/ --metrics-log /output/metrics.jsonl
+
+    # Cleanup and result collection
+    echo "Zipping results..."
+    cd /output
+    zip -r results.zip ./*
+
+    echo "Shutting down Ollama..."
+    kill $OLLAMA_PID
