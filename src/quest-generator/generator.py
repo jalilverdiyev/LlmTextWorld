@@ -247,16 +247,6 @@ def make_quest(desc: str, commands: list[str], win_events: list[dict[str, Any]])
     }
 
 
-def _norm(commands: list[str]) -> list[str]:
-    return [" ".join(c.lower().split()) for c in commands]
-
-
-def _contains(whole: list[str], part: list[str]) -> bool:
-    """True if `part` appears as a contiguous run inside `whole`."""
-    n = len(part)
-    return any(whole[i:i + n] == part for i in range(len(whole) - n + 1))
-
-
 def collect_valid_quests(raw_quests: list[dict[str, Any]], game: Game, builder: QuestBuilder,
                          limit: Optional[int] = None) -> list[dict[str, Any]]:
     """Turns raw model quests into complete game-file quests.
@@ -281,13 +271,13 @@ def collect_valid_quests(raw_quests: list[dict[str, Any]], game: Game, builder: 
             continue
         candidates.append(make_quest(desc, commands, [win_event]))
 
-    existing = [_norm(q["commands"]) for q in game.quests if isinstance(q.get("commands"), list)]
-    commands = [_norm(c["commands"]) for c in candidates]
+    existing = [validator.normalize_commands(q["commands"]) for q in game.quests if isinstance(q.get("commands"), list)]
+    commands = [validator.normalize_commands(c["commands"]) for c in candidates]
     quests = []
     for i, candidate in enumerate(candidates):
-        if any(_contains(e, commands[i]) for e in existing):
+        if any(validator.is_contiguous_part(e, commands[i]) for e in existing):
             log.warning("Dropping quest %r: repeats or splits an existing quest", candidate["desc"])
-        elif any(j != i and _contains(commands[j], commands[i])
+        elif any(j != i and validator.is_contiguous_part(commands[j], commands[i])
                  and (len(commands[j]) > len(commands[i]) or j < i)
                  for j in range(len(candidates))):
             log.warning("Dropping quest %r: duplicate or fragment of another generated quest",
@@ -344,6 +334,16 @@ def refresh_derived_fields(data: dict[str, Any]) -> dict[str, Any]:
         return data
 
 
+def run_validation(data: dict[str, Any], existing: list[dict[str, Any]], keep_existing: bool,
+                   plan_budget: int) -> "validator.ValidationReport":
+    """Validates the final game JSON, printing a summary. Callers must check `report.ok`."""
+    report = validator.validate(data, existing, keep_existing, plan_budget)
+    print(report.summary())
+    if not report.ok:
+        print("error: the final game file failed validation; see the log file for details", file=sys.stderr)
+    return report
+
+
 def compile_output(path: Path) -> bool:
     """Compiles the game JSON at `path` to a .z8 next to it, reporting errors. True on success."""
     try:
@@ -373,6 +373,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                         help="With --fill-win-events: also rebuild quests that already have win_events")
     parser.add_argument("--keep-objective", action="store_true",
                         help="Do not rebuild the game's objective text and metadata.walkthrough from the quests")
+    validator.add_validation_args(parser)
     parser.add_argument("--compile", action="store_true",
                         help="After writing the output JSON, compile it to a playable .z8 next to it")
     parser.add_argument("--prompt-only", action="store_true", help="Print the prompt and exit")
@@ -383,6 +384,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     try:
         config.load_dotenv(args.env_file)
         logs.setup_from_args("generator", args, argv)
+        validate_enabled, plan_budget = validator.validation_settings(args)
         game = Game(load_json(args.game))
         if not args.fill_win_events:
             prompt = build_prompt(game, TypeDefinitions.load(args.types), args.num_quests)
@@ -402,6 +404,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             log.error("Filling win_events failed: %s", e)
             print(f"error: {e}", file=sys.stderr)
             return 1
+        if validate_enabled:
+            report = run_validation(output, game.quests, True, plan_budget)
+            if not report.ok:
+                return 1
+            output = report.data
         refreshed = False
         if not args.keep_objective and not failed:
             updated = refresh_derived_fields(output)
@@ -454,6 +461,16 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     output = copy.deepcopy(game.data)
     output["quests"] = quests if args.replace_quests else output.get("quests", []) + quests
+    if validate_enabled:
+        report = run_validation(output, game.quests, not args.replace_quests, plan_budget)
+        if not report.ok:
+            return 1
+        output = report.data
+        quests = output["quests"] if args.replace_quests else output["quests"][len(game.quests):]
+        if not quests:
+            log.error("No new quest survived validation")
+            print("error: no new quest survived validation", file=sys.stderr)
+            return 1
     if not args.keep_objective:
         output = refresh_derived_fields(output)
     out_path.write_text(json.dumps(output, indent=4), encoding="utf-8")
